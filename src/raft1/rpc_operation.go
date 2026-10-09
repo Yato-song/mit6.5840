@@ -1,0 +1,226 @@
+package raft
+
+import (
+	"log"
+	"time"
+)
+
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+type RequestVoteArgs struct {
+	// Your data here (3A, 3B).
+	Term TermNumber
+	CandidateId ServerID
+	LastLogIndex int
+	LastLogTerm TermNumber
+}
+
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	// Your data here (3A).
+	Term TermNumber
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term TermNumber
+	LeaderId ServerID
+	PrevLogIndex int
+	PrevLogTerm TermNumber
+	Entries []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term TermNumber
+	Success bool
+}
+
+
+// example code to send a RequestVote RPC to a server.
+// server is the index of the target server in rf.peers[].
+// expects RPC arguments in args.
+// fills in *reply with RPC reply, so caller should
+// pass &reply.
+// the types of the args and reply passed to Call() must be
+// the same as the types of the arguments declared in the
+// handler function (including whether they are pointers).
+//
+// The labrpc package simulates a lossy network, in which servers
+// may be unreachable, and in which requests and replies may be lost.
+// Call() sends a request and waits for a reply. If a reply arrives
+// within a timeout interval, Call() returns true; otherwise
+// Call() returns false. Thus Call() may not return for a while.
+// A false return can be caused by a dead server, a live server that
+// can't be reached, a lost request, or a lost reply.
+//
+// Call() is guaranteed to return (perhaps after a delay) *except* if the
+// handler function on the server side does not return.  Thus there
+// is no need to implement your own timeouts around Call().
+//
+// look at the comments in ../labrpc/labrpc.go for more details.
+//
+// if you're having trouble getting RPC to work, check that you've
+// capitalized all field names in structs passed over RPC, and
+// that the caller passes the address of the reply struct with &, not
+// the struct itself.
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// example RequestVote RPC handler.
+// 该函数用于处理其他peer的RequestVote请求
+/* 规则：
+1. 请求中的term 不得小于当前节点的 currentTerm
+2. 当前节点的voteFor 为空，或者等于请求中的candidateId，且请求节点的日志至少和当前节点的日志一样新，则可以grant vote
+*/
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term > rf.state.GetCurrentTerm() {
+		rf.state.SetCurrentTerm(args.Term)
+		rf.state.SetRole(Follower)
+		rf.state.SetVotedFor(-1)
+	}
+
+	if args.Term < rf.state.GetCurrentTerm()  {
+		reply.Term = rf.state.GetCurrentTerm()
+		reply.VoteGranted = false
+		log.Printf("[node=%v, term=%v, currentRole=%v] 拒绝投票: 请求term(%v)小于当前节点 term", rf.me, rf.state.GetCurrentTerm(), rf.state.GetRole(), args.Term)
+		return
+	}
+
+	if rf.state.GetVotedFor() != ServerID(-1) && rf.state.GetVotedFor() != args.CandidateId {
+		reply.Term = rf.state.GetCurrentTerm()
+		reply.VoteGranted = false
+		log.Printf("[node=%v, term=%v, currentRole=%v] 拒绝投票: 已投票(%v)且并非投给请求节点", rf.me, rf.state.GetCurrentTerm(), rf.state.GetRole(), rf.state.GetVotedFor())
+		return
+	}
+
+	// check if candidate's log is at least as up-to-date as receiver's log
+	if !rf.AsUpToDateAsMe(args.LastLogTerm, args.LastLogIndex) {
+		reply.Term = rf.state.GetCurrentTerm()
+		reply.VoteGranted = false
+		log.Printf("[node=%v, term=%v, currentRole=%v] 拒绝投票: 候选人日志没有当前节点新", rf.me, rf.state.GetCurrentTerm(), rf.state.GetRole())
+		return
+	}
+
+	// grant vote
+
+	// Figure2 Rules for followers, second rule: 投票完要重置election timeout计时
+	rf.lastHeratBeat = time.Now()
+
+	rf.state.SetVotedFor(args.CandidateId)
+	reply.Term = rf.state.GetCurrentTerm()
+	reply.VoteGranted = true
+	log.Printf("[node=%v, term=%v, currentRole=%v] 投票成功, 选票投给node%v", rf.me, rf.state.GetCurrentTerm(), rf.state.GetRole(), args.CandidateId)
+	return
+}
+
+// 该函数用于处理来自leader的日志追加请求
+/*
+step1: 任期检查
+	- args.Term < currentTerm：返回当前任期，直接拒绝，不重置计时。
+	- args.Term > currentTerm：更新任期、清空 votedFor，转为 Follower。
+	- args.Term == currentTerm：如果自己是 Candidate，也转为 Follower，但不要清空 votedFor。
+step2: 重置选举计时
+step3: 检查RPC中的PrevLogIndex && PrevLogTerm 对应的log entry时否则在当前节点中存在（即leader在尝试找到和follower达成一致的某个entry）
+	检查index和term是否全部相同。若不相同，拒绝；相同，可以继续step4
+step4: 合并日志：逐条比较RPC中包含的log entry和当前节点PrevLogIndex && PrevLogTerm 后的log entry
+	- 本地存在且任期相同：保留，继续比较。
+	- 本地存在但任期不同：删除本地从该位置开始的所有日志，追加请求中从该位置开始的剩余日志。
+	- 本地不存在：直接追加请求中剩余的日志。
+step5: 更新当前节点commitIndex
+*/
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+
+	// step1 任期检查
+	if args.Term < rf.state.GetCurrentTerm() {
+		reply.Term = rf.state.GetCurrentTerm()
+		reply.Success = false
+		return
+	}
+
+	if args.Term > rf.state.GetCurrentTerm() {
+		rf.state.SetCurrentTerm(args.Term)
+		rf.state.SetRole(Follower)
+		rf.state.SetVotedFor(-1)
+	}
+
+	if args.Term == rf.state.GetCurrentTerm() && rf.state.GetRole() == Candidate {
+		rf.state.SetRole(Follower)
+	}
+
+	// step2 重置选举计时
+	rf.lastHeratBeat = time.Now()
+
+	// step3 PrevLogIndex && PrevLogTerm检查
+	idx := args.PrevLogIndex
+	if idx >= len(rf.state.logs) {
+		// 当前节点不存在 idx = PrevLogIndex 的entry
+		reply.Term = rf.state.GetCurrentTerm()
+		reply.Success = false
+		return
+	}
+	log_entry := rf.state.GetLogEntry(idx)
+	if log_entry.GetTerm() != args.PrevLogTerm {
+		// 存在 idx = PrevLogIndex 的entry, 但term对应不上
+		reply.Term = rf.state.GetCurrentTerm()
+		reply.Success = false
+		return
+	}
+
+	// step4 合并日志
+	idx++
+	// 这里 不可以 直接删除PrevLogIndex && PrevLogTerm 后的entry然后直接把args中的entry直接追加到当前节点的日志后面
+	// 因为网络可能让先发出的appendEntriesRPC后到达，如果采用删除追加，则会让后发出的更新更多的entry被后到达的RPC覆盖删除掉
+	for _, l := range args.Entries {
+		if idx < len(rf.state.logs) {
+			entry := rf.state.GetLogEntry(idx)
+			if entry.GetTerm() == l.GetTerm() {
+				// case1 本地存在entry且任期相同
+				idx++;
+				continue
+			} else {
+				// case2 本地存在但任期不同
+				rf.state.TruncateLogsFrom(idx)
+				rf.state.AppendLogEntry(l)
+				idx++
+			}
+		} else {
+			// case3 本地不存在
+			rf.state.AppendLogEntry(l)
+			idx++
+		}
+	}
+
+	// step5 更新当前节点
+	if args.LeaderCommit > rf.state.GetCommitIndex() {
+		commit_idx := min_int(args.LeaderCommit, args.PrevLogIndex + len(args.Entries))
+		rf.state.SetCommitIndex(commit_idx)
+	}
+	rf.cond.Signal()
+
+	reply.Term = rf.state.GetCurrentTerm()
+	reply.Success = true
+	return
+}
+
+func min_int(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

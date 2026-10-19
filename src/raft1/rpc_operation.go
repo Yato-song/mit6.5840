@@ -35,8 +35,23 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term TermNumber
 	Success bool
+	ConflictType int
+	MaxIndex int
+	ConflictTerm TermNumber
+	ConflictTermFirstIndex int
 }
 
+type InstallSnapshotArgs struct {
+	Term TermNumber // leader's term
+	LeaderID ServerID
+	LastIncludeIndex int
+	LastIncludeTerm TermNumber
+	Data []byte // raw bytes of snapshot
+}
+
+type InstallSnapshotReply struct {
+	Term TermNumber
+}
 
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -75,6 +90,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 // example RequestVote RPC handler.
 // 该函数用于处理其他peer的RequestVote请求
 /* 规则：
@@ -90,6 +110,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state.SetCurrentTerm(args.Term)
 		rf.state.SetRole(Follower)
 		rf.state.SetVotedFor(-1)
+		// 持久化
+		rf.persist()
 	}
 
 	if args.Term < rf.state.GetCurrentTerm()  {
@@ -120,6 +142,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lastHeratBeat = time.Now()
 
 	rf.state.SetVotedFor(args.CandidateId)
+	// 持久化
+	rf.persist()
+
 	reply.Term = rf.state.GetCurrentTerm()
 	reply.VoteGranted = true
 	log.Printf("[node=%v, term=%v, currentRole=%v] 投票成功, 选票投给node%v", rf.me, rf.state.GetCurrentTerm(), rf.state.GetRole(), args.CandidateId)
@@ -157,6 +182,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state.SetCurrentTerm(args.Term)
 		rf.state.SetRole(Follower)
 		rf.state.SetVotedFor(-1)
+
+		// 持久化
+		rf.persist()
 	}
 
 	if args.Term == rf.state.GetCurrentTerm() && rf.state.GetRole() == Candidate {
@@ -167,19 +195,69 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastHeratBeat = time.Now()
 
 	// step3 PrevLogIndex && PrevLogTerm检查
+	/*
+		case1: PrevLogIndex位于快照边界前
+			a) 来自leader的log entry完全被本地快照包含：直接返回success即可
+			b) 来自leader的log entry跨过快照边界：裁减请求中的log entries，把边界后的log进行合并
+		case2: PrevLogIndex等于快照边界lastIncludeIndex
+				合并log
+		case3: PrevLogIndex位于快照边界后的日志中
+				判断PrevLogIndex && PrevLogTerm的合法性
+	*/
 	idx := args.PrevLogIndex
-	if idx >= len(rf.state.logs) {
-		// 当前节点不存在 idx = PrevLogIndex 的entry
-		reply.Term = rf.state.GetCurrentTerm()
-		reply.Success = false
-		return
-	}
-	log_entry := rf.state.GetLogEntry(idx)
-	if log_entry.GetTerm() != args.PrevLogTerm {
-		// 存在 idx = PrevLogIndex 的entry, 但term对应不上
-		reply.Term = rf.state.GetCurrentTerm()
-		reply.Success = false
-		return
+	last_log_idx := args.PrevLogIndex + len(args.Entries)
+	if idx < rf.state.GetLastIncludeIndex() {
+		last_idx := idx + len(args.Entries)
+		// case a
+		if last_idx <= rf.state.GetLastIncludeIndex() {
+			reply.Term = rf.state.GetCurrentTerm()
+			reply.Success = true
+			return
+		} else {
+			// 裁减冗余日志 等待后续合并
+			act_begin_idx := rf.state.GetLastIncludeIndex() - args.PrevLogIndex 
+			args.Entries = append([]LogEntry(nil), args.Entries[act_begin_idx:]...)
+			idx = rf.state.GetLastIncludeIndex()
+		}
+	} else if idx == rf.state.GetLastIncludeIndex() {
+		if rf.state.GetLastIncludeTerm() != args.PrevLogTerm {
+			// 异常场景
+			log.Printf(
+				"[FATAL] snapshot boundary mismatch: node=%d currentTerm=%d "+
+					"leader=%d requestTerm=%d index=%d "+
+					"localLogTerm=%d requestLogTerm=%d",
+				rf.me, rf.state.GetCurrentTerm(),
+				args.LeaderId, args.Term, args.PrevLogIndex,
+				rf.state.GetLastIncludeTerm(), args.PrevLogTerm,
+			)
+			panic("snapshot boundary mismatch")
+		}
+		// 合法PrevLogIndex && PrevLogTerm，等待日志合并
+	} else {
+		if idx > rf.state.GetLastLogIndex() {
+			// 当前节点不存在 idx = PrevLogIndex 的entry
+			reply.Term = rf.state.GetCurrentTerm()
+			reply.Success = false
+			reply.ConflictType = 1
+			reply.MaxIndex = rf.state.GetLastLogIndex()
+			return
+		}
+		log_entry := rf.state.GetLogEntry(idx)
+		if log_entry.GetTerm() != args.PrevLogTerm {
+			// 存在 idx = PrevLogIndex 的entry, 但term对应不上
+			reply.Term = rf.state.GetCurrentTerm()
+			reply.Success = false
+			reply.ConflictType = 2
+			reply.ConflictTerm = log_entry.GetTerm()
+			// 计算冲突term的第一个log entry的index
+			first := idx
+			for first > rf.state.GetLastIncludeIndex()+1 &&
+				rf.state.GetLogEntry(first-1).Term == log_entry.Term {
+				first--
+			}
+			reply.ConflictTermFirstIndex = first
+			return
+		}
 	}
 
 	// step4 合并日志
@@ -187,7 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 这里 不可以 直接删除PrevLogIndex && PrevLogTerm 后的entry然后直接把args中的entry直接追加到当前节点的日志后面
 	// 因为网络可能让先发出的appendEntriesRPC后到达，如果采用删除追加，则会让后发出的更新更多的entry被后到达的RPC覆盖删除掉
 	for _, l := range args.Entries {
-		if idx < len(rf.state.logs) {
+		if idx <= rf.state.GetLastLogIndex() {
 			entry := rf.state.GetLogEntry(idx)
 			if entry.GetTerm() == l.GetTerm() {
 				// case1 本地存在entry且任期相同
@@ -205,11 +283,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			idx++
 		}
 	}
+	// 持久化
+	rf.persist()
 
-	// step5 更新当前节点
-	if args.LeaderCommit > rf.state.GetCommitIndex() {
-		commit_idx := min_int(args.LeaderCommit, args.PrevLogIndex + len(args.Entries))
-		rf.state.SetCommitIndex(commit_idx)
+	// step5 更新当前节点commitIndex
+	newCommit := min_int(
+		args.LeaderCommit,
+		last_log_idx,
+	)
+	if newCommit > rf.state.GetCommitIndex() {
+		rf.state.SetCommitIndex(newCommit)
 	}
 	rf.cond.Signal()
 
@@ -218,6 +301,74 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	return
 }
 
+// 该函数用于处理来自leader的快照更新请求
+/*
+step1: 先判断term是否合理
+step2: 
+       裁减日志
+	   更新lastIncludedIndex && lastIncludedTerm && snapshot
+	- case1: 节点不存在index为LastIncludeIndex的log entry。这表示快照比当前节点的最新日志还新，此时直接丢弃本地日志，并更新snapshot
+	- case2: 节点存在index为LastIncludeIndex的log entry， 但这个entry的Term和LastIncludeTerm不一致。 这表示此处的entry和leader发生了
+			 不一致，也就表示此entry之后的所有entry也不可能与leader一致。所以直接丢弃所有日志，更新snapshot
+	- case3: 节点存在index为LastIncludeIndex的log entry， 且Term一致。此时裁减包含该entry在内的之前的日志，保留之后的日志，更新snapshot
+step3: 持久化
+step4: 应用快照到状态机
+*/
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// step1
+	if args.Term < rf.state.GetCurrentTerm() {
+		reply.Term = rf.state.GetCurrentTerm()
+		// reply.Success = false
+		return
+	}
+
+	if args.Term > rf.state.GetCurrentTerm() {
+		rf.state.SetCurrentTerm(args.Term)
+		rf.state.SetRole(Follower)
+		rf.state.SetVotedFor(-1)
+
+		// 持久化
+		rf.persist()
+	}
+
+	if args.Term == rf.state.GetCurrentTerm() && rf.state.GetRole() == Candidate {
+		rf.state.SetRole(Follower)
+	}
+	// 重置选举超时时间
+	rf.lastHeratBeat = time.Now()
+
+	// step2
+	if args.LastIncludeIndex <= rf.state.GetLastIncludeIndex() {
+		// 快照不够新，忽略
+		reply.Term = rf.state.GetCurrentTerm()
+		return
+	}
+	if args.LastIncludeIndex <= rf.state.GetLastLogIndex() && args.LastIncludeTerm == rf.state.GetLogEntry(args.LastIncludeIndex).Term {
+		// 对应case3
+		rf.state.TruncateLogsTo(args.LastIncludeIndex)
+	} else {
+		// 对应case1 && 2
+		rf.state.ClearLogs()
+	}
+	rf.state.SetSnapshotBytes(args.Data)
+	rf.state.SetLastIncludeIndex(args.LastIncludeIndex)
+	rf.state.SetLastIncludeTerm(args.LastIncludeTerm)
+
+	// step3
+	rf.persist()
+
+	// step4
+	// 通过applier进行状态机同步
+	rf.pendingSnapshot = true
+	rf.cond.Signal()
+
+	reply.Term = rf.state.GetCurrentTerm()
+}
+
+// support function
 func min_int(a int, b int) int {
 	if a < b {
 		return a

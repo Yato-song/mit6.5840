@@ -14,8 +14,10 @@ import (
 	"sync"
 	"time"
 	"log"
+	"bytes"
+	"fmt"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -34,6 +36,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	state RaftState
 	applyCh chan raftapi.ApplyMsg
+	pendingSnapshot bool // 记录是否有待传给上层的snapshot
 		
 	replicate  []chan struct{} // 唤醒每个 follower 的复制协程
 
@@ -82,6 +85,27 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	// my code
+	buf := new(bytes.Buffer) // *bytes.Buffer
+	encoder := labgob.NewEncoder(buf)
+	if err := encoder.Encode(rf.state.GetCurrentTerm()); err != nil {
+		panic(fmt.Errorf("raft persist currentTerm: %w", err))
+	}
+	if err := encoder.Encode(rf.state.GetVotedFor()); err != nil {
+		panic(fmt.Errorf("raft persist voteFor: %w", err))
+	}
+	if err := encoder.Encode(rf.state.GetAllLogEntry()); err != nil {
+		panic(fmt.Errorf("raft persist logs: %w", err))
+	}
+	if err := encoder.Encode(rf.state.GetLastIncludeIndex()); err != nil {
+		panic(fmt.Errorf("raft persist lastIncludeIndex: %w", err))
+	}
+	if err := encoder.Encode(rf.state.GetLastIncludeTerm()); err != nil {
+		panic(fmt.Errorf("raft persist lastIncludeTerm: %w", err))
+	}
+
+	rf.persister.Save(buf.Bytes(), rf.state.GetSnapshotBytes())
 }
 
 
@@ -103,6 +127,39 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	// my code
+	reader := bytes.NewReader(data)
+	decoder := labgob.NewDecoder(reader)
+
+	var term TermNumber
+	var vote ServerID
+	var logs []LogEntry
+	var index int
+	var l_term TermNumber
+
+	if err := decoder.Decode(&term); err != nil {
+		panic(fmt.Errorf("raft decode currentTerm: %w", err))
+	}
+	if err := decoder.Decode(&vote); err != nil {
+		panic(fmt.Errorf("raft decode voteFor: %w", err))
+	}
+	if err := decoder.Decode(&logs); err != nil {
+		panic(fmt.Errorf("raft decode logs: %w", err))
+	}
+	if err := decoder.Decode(&index); err != nil {
+		panic(fmt.Errorf("raft decode lastIncludeIndex: %w", err))
+	}
+	if err := decoder.Decode(&l_term); err != nil {
+		panic(fmt.Errorf("raft decode lastIncludTerm: %w", err))
+	}
+
+	// 全部解码成功
+	rf.state.SetCurrentTerm(term)
+	rf.state.SetVotedFor(vote)
+	rf.state.SetLogEntry(logs)
+	rf.state.SetLastIncludeIndex(index)
+	rf.state.SetLastIncludeTerm(l_term)
 }
 
 // how many bytes in Raft's persisted log?
@@ -117,9 +174,24 @@ func (rf *Raft) PersistBytes() int {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// 该接口的作用是 上层应用通知本节点 Raft：“我已经把执行到 index 的状态做成快照了，你可以保存它并裁剪对应日志。”
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if index <= rf.state.GetLastIncludeIndex() {
+    	return
+	}
+
+	// trim log to index
+	term := rf.state.GetLogEntry(index).Term
+	rf.state.TruncateLogsTo(index)
+	rf.state.SetLastIncludeIndex(index)
+	rf.state.SetLastIncludeTerm(term)
+	rf.state.SetSnapshotBytes(snapshot)
+	
+	rf.persist()
 }
 
 
@@ -157,7 +229,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.state.AppendLogEntry(new_log)
 	index = rf.state.GetLastLogIndex()
 	rf.state.SetMatchIndex(rf.me, index)
-	// todo: 持久化
+	// 持久化
+	rf.persist()
 
 	// 触发日志同步
 	for idx := range rf.peers {
@@ -207,6 +280,8 @@ func (rf *Raft) CheckElection() {
 				continue
 			}
 
+			go rf.sendHeartBeat(idx)
+
 			// 通过trigger函数触发心跳
 			rf.trigger(idx)
 		}
@@ -228,7 +303,9 @@ func (rf *Raft) CheckElection() {
 	rf.lastHeratBeat = time.Now()
 	rf.state.SetCurrentTerm(rf.state.GetCurrentTerm() + 1)
 	rf.state.SetVotedFor(ServerID(rf.me))
-	// todo: 持久化
+	// 持久化
+	rf.persist()
+
 	rf.state.SetRole(Candidate)
 	// 初始值为1，表示投票给自己
 	vote_num := 1
@@ -265,7 +342,8 @@ func (rf *Raft) CheckElection() {
 				rf.state.SetCurrentTerm(rep.Term)
 				rf.state.SetRole(Follower)
 				rf.state.SetVotedFor(-1)
-				// todo: 持久化
+				// 持久化
+				rf.persist()
 				return
 			}
 
@@ -300,94 +378,54 @@ func (rf *Raft) trigger(peer int) {
 	}
 }
 
-// 日志同步协程执行该函数进行日志同步
-// 入参：需要触发同步的raft节点的下标
-// 思路：
-// 1. 从channel中取出一个信号
-// 2. 加锁，准备同步请求
-// 3. 解锁，发送AppendLogRPC
-// 4. 检查RPC调用结果：
-// 	4.1 调用超时：等待下次同步触发
-//  4.2 调用成功，但返回false：加锁 调整请求参数立刻重新请求
-func (rf *Raft) replicator(peer int) {
-	for {
-		<- rf.replicate[peer]
-		
-		for {
-			rf.mu.Lock()
 
-			if rf.state.GetRole() != Leader {
-				// 非leader 什么也不做
-				rf.mu.Unlock()
-				break
-			}
+// 发送心跳协程的执行函数。发送心跳和日志同步协程相互独立，防止互相阻塞
+func (rf *Raft) sendHeartBeat(peer int) {
+	rf.mu.Lock()
 
-			next := rf.state.GetNextId(peer)
-			pre := next - 1
-			term := rf.state.GetCurrentTerm()
-			req := &AppendEntriesArgs{
-				Term: term,
-				LeaderId: ServerID(rf.me),
-				PrevLogIndex: pre,
-				PrevLogTerm: rf.state.GetLogEntry(pre).Term,
-				Entries: rf.state.CopyLogFrom(next),
-				LeaderCommit: rf.state.GetCommitIndex(),
-			}
-			// 记录追加日志最后一个entry的index
-			last_idx := pre + len(req.Entries)
-			rf.mu.Unlock()
-
-			// 发送同步请求
-			var rep AppendEntriesReply
-			if !rf.sendAppendEntries(peer, req, &rep) {
-				// 调用超时：等待下次心跳或者同步到来时重新同步
-				break
-			}
-
-			
-			rf.mu.Lock()
-
-			// 先判断term
-			if rep.Term > rf.state.GetCurrentTerm() {
-				// 自己的term已过时：更新自己的term，并退回follower角色
-				rf.state.SetCurrentTerm(rep.Term)
-				rf.state.SetRole(Follower)
-				rf.state.SetVotedFor(-1)
-				// todo: 持久化
-				
-				rf.mu.Unlock()
-				break
-			}
-
-			// 判断是否是失效的rpc调用
-			if rf.state.GetRole() != Leader || rf.state.GetCurrentTerm() != term {
-				// 失效rpc响应，忽略，不进行任何操作
-				rf.mu.Unlock()
-				break
-			}
-
-			// 调用成功，且返回true
-			if rep.Success {
-				// 更新nextIndex 和 matchIndex
-				if rf.state.GetMatchIndex(peer) < last_idx {
-					rf.state.SetMatchIndex(peer, last_idx)
-				}
-				rf.state.SetNextId(peer, rf.state.GetMatchIndex(peer) + 1)
-
-				// 更新commitIndex
-				rf.state.UpdateCommitIndex()
-				rf.cond.Signal()
-
-				rf.mu.Unlock()
-				break;
-			}
-
-			// 至此 表示PrevLogIndex && PrevLogTerm不匹配，调整重试
-			rf.state.SetNextId(peer, next - 1)
-			rf.mu.Unlock()
-			continue
-		}
+	if rf.state.GetRole() != Leader {
+		rf.mu.Unlock()
+		return
 	}
+
+	pre := rf.state.GetNextId(peer) - 1
+	pre_log_term := TermNumber(-1)
+	// 处理存在snapshot时的边界日志场景
+	if pre <= rf.state.GetLastIncludeIndex() {
+		// 原前驱已被裁剪，使用快照边界发送空心跳。
+		pre = rf.state.GetLastIncludeIndex()
+		pre_log_term = rf.state.GetLastIncludeTerm()
+	} else {
+		pre_log_term = rf.state.GetLogEntry(pre).Term
+	}
+	req := &AppendEntriesArgs{
+		Term: rf.state.GetCurrentTerm(),
+		LeaderId: ServerID(rf.me),
+		PrevLogIndex: pre,
+		PrevLogTerm: pre_log_term,
+		Entries: []LogEntry{},
+		LeaderCommit: rf.state.GetCommitIndex(),
+	}
+
+	rf.mu.Unlock()
+
+	var rep AppendEntriesReply
+	if !rf.sendAppendEntries(peer, req, &rep) {
+		// 调用超时，返回
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rep.Term > rf.state.GetCurrentTerm() {
+        rf.state.SetCurrentTerm(rep.Term)
+        rf.state.SetRole(Follower)
+        rf.state.SetVotedFor(-1)
+        rf.persist()
+    }
+
+	// 心跳回复不修改 nextIndex、matchIndex 或 commitIndex
 }
 
 // 将已提交log应用到上层状态机的后台协程
@@ -396,24 +434,49 @@ func (rf *Raft) applier() {
 		rf.mu.Lock()
 
 		// 已commit的log和已apply的log进度一致，阻塞等待
-		for rf.state.GetLastApplied() >= rf.state.GetCommitIndex() {
+		for rf.state.GetLastApplied() >= rf.state.GetCommitIndex() && !rf.pendingSnapshot {
 			rf.cond.Wait()
 		}
 
-		index := rf.state.GetLastApplied() + 1
-		msg := raftapi.ApplyMsg{
-			CommandValid: true,
-			Command: rf.state.GetLogEntry(index).Command,
-			CommandIndex: index,
+		var msg raftapi.ApplyMsg
+		if rf.pendingSnapshot {
+			if rf.state.GetLastIncludeIndex() <= rf.state.GetLastApplied() {
+				rf.pendingSnapshot = false
+				rf.mu.Unlock()
+				continue
+			}
+
+			msg = raftapi.ApplyMsg{
+				CommandValid: false,
+				SnapshotValid: true,
+				Snapshot: rf.state.GetSnapshotBytes(),
+				SnapshotTerm: int(rf.state.GetLastIncludeTerm()),
+				SnapshotIndex: rf.state.GetLastIncludeIndex(),
+			}
+			
+			// 推进 lastApplied 和 commitIndex
+			if rf.state.GetLastApplied() < rf.state.GetLastIncludeIndex() {
+				rf.state.SetLastApplied(rf.state.GetLastIncludeIndex())
+			}
+			if rf.state.GetLastIncludeIndex() > rf.state.GetCommitIndex() {
+				rf.state.SetCommitIndex(rf.state.GetLastIncludeIndex())
+			}
+
+			rf.pendingSnapshot = false
+		} else {
+			index := rf.state.GetLastApplied() + 1
+			msg = raftapi.ApplyMsg{
+				CommandValid: true,
+				Command: rf.state.GetLogEntry(index).Command,
+				CommandIndex: index,
+				SnapshotValid: false,
+			}
+			rf.state.SetLastApplied(index)
 		}
 		rf.mu.Unlock()
 
 		// 上层接收可能阻塞，不能持有 Raft 锁。
 		rf.applyCh <- msg
-
-		rf.mu.Lock()
-		rf.state.lastApplied = index
-		rf.mu.Unlock()
 	}
 }
 
@@ -435,6 +498,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.applyCh = applyCh
+	rf.pendingSnapshot = false
 	rf.cond = *sync.NewCond(&rf.mu)
 	rf.lastHeratBeat = time.Now()
 	rf.lastSendHeartBeat = time.Now()
@@ -444,6 +508,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		currentTerm: TermNumber(0),
 		votedFor: -1,
 		logs: make([]LogEntry, 1),
+		lastIncludedIndex: -1,
+		lastIncludeTerm: -1,
 		role: Follower,
 		commitIndex: 0,
 		lastApplied: 0,
@@ -455,15 +521,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.replicate[i] = make(chan struct{}, 1)
 	}
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+	rf.state.SetSnapshotBytes(persister.ReadSnapshot())
+	base := rf.state.GetLastIncludeIndex()
+	if base < 0 {
+		base = 0 // 兼容无快照时边界为 -1 的设计
+	}
+	rf.state.SetLastApplied(base)
+	rf.state.SetCommitIndex(base)
+
 	for i := range rf.replicate {
 		// 为每一个节点创建日志同步协程
 		go rf.replicator(i)
 	}
 
 	go rf.applier()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

@@ -20,6 +20,9 @@ type RaftState struct {
 	currentTerm TermNumber
 	votedFor    ServerID
 	logs        []LogEntry
+	lastIncludedIndex int // 快照中包含的最后一个log entry的index
+	lastIncludeTerm TermNumber
+	snapshot []byte
 	// volatile state on all servers
 	role Role
 	commitIndex int
@@ -46,16 +49,40 @@ func (rs *RaftState) SetVotedFor(candidateId ServerID) {
 }
 
 func (rs *RaftState) GetLogEntry(idx int) LogEntry {
-	return rs.logs[idx]
+	return rs.logs[idx - rs.lastIncludedIndex - 1]
+}
+
+func (rs *RaftState) GetAllLogEntry() []LogEntry {
+	return rs.logs
+}
+
+func (rs *RaftState) SetLogEntry(logs []LogEntry) {
+	rs.logs = logs
+}
+
+func (rs *RaftState) GetLogLength() int {
+	return len(rs.logs)
 }
 
 // 从下标idx开始（包括idx）丢弃后面的日志
 func (rs *RaftState) TruncateLogsFrom(idx int) {
-	if idx >= len(rs.logs) {
+	if idx - rs.lastIncludedIndex - 1 >= len(rs.logs) {
 		return
 	}
 
-	rs.logs = rs.logs[:idx]
+	rs.logs = rs.logs[:idx - rs.lastIncludedIndex - 1]
+}
+
+// 丢弃下标小于等于idx的日志
+func (rs *RaftState) TruncateLogsTo(idx int) {
+	if idx - rs.lastIncludedIndex - 1 >= len(rs.logs) {
+		return
+	}
+	rs.logs = append([]LogEntry(nil), rs.logs[idx-rs.lastIncludedIndex:]...)
+}
+
+func (rs *RaftState) ClearLogs() {
+	rs.logs = nil
 }
 
 func (rs *RaftState) AppendLogEntry(l LogEntry) {
@@ -63,13 +90,13 @@ func (rs *RaftState) AppendLogEntry(l LogEntry) {
 }
 
 func (rs *RaftState) GetLastLogIndex() int {
-	return len(rs.logs) - 1
+	return len(rs.logs) + rs.lastIncludedIndex
 }
 
 func (rs *RaftState) GetLastLogTerm() TermNumber {
 	last_log_idx := rs.GetLastLogIndex()
-	if last_log_idx <= 0 {
-		return TermNumber(0)
+	if last_log_idx <= rs.GetLastIncludeIndex() {
+		return rs.GetLastIncludeTerm()
 	}
 
 	entry := rs.GetLogEntry(last_log_idx)
@@ -79,11 +106,11 @@ func (rs *RaftState) GetLastLogTerm() TermNumber {
 
 // 复制logs从idx下标开始的元素
 func (rs *RaftState) CopyLogFrom(idx int) []LogEntry {
-	if idx >= len(rs.logs) {
+	if idx - rs.lastIncludedIndex - 1 >= len(rs.logs) {
 		// idx 大于等于logs的长度，返回空切片
 		return []LogEntry{}
 	}
-	entries := append([]LogEntry(nil), rs.logs[idx:]...)
+	entries := append([]LogEntry(nil), rs.logs[idx - rs.lastIncludedIndex - 1:]...)
 	return entries
 }
 
@@ -169,4 +196,32 @@ func (rs *RaftState) UpdateCommitIndex() {
 
 func (rs *RaftState) GetLastApplied() int {
 	return rs.lastApplied
+}
+
+func (rs *RaftState) SetLastApplied(idx int) {
+	rs.lastApplied = idx
+}
+
+func (rs *RaftState) GetLastIncludeIndex() int {
+	return rs.lastIncludedIndex
+}
+
+func (rs *RaftState) SetLastIncludeIndex(idx int) {
+	rs.lastIncludedIndex = idx
+}
+
+func (rs *RaftState) GetLastIncludeTerm() TermNumber {
+	return rs.lastIncludeTerm
+}
+
+func (rs *RaftState) SetLastIncludeTerm(term TermNumber) {
+	rs.lastIncludeTerm = term
+}
+
+func (rs *RaftState) GetSnapshotBytes() []byte {
+	return rs.snapshot
+}
+
+func (rs *RaftState) SetSnapshotBytes(bytes []byte) {
+	rs.snapshot = bytes
 }

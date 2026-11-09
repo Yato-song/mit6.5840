@@ -1,22 +1,38 @@
 package rsm
 
 import (
+	"crypto/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
+
+const (
+	submitTimeout = 900 * time.Millisecond
+)
+
+type Epoch [16]byte
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me    int
+	Epoch Epoch // 随机16位字节串
+	Id    int
+	Req   any
 }
 
+type Uid struct {
+	Me    int
+	Epoch Epoch
+	Id    int
+}
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +54,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	mp    map[Uid]chan interface{}
+	id    int
+	epoch Epoch // fresh for each RSM instance, including after restart
 }
 
 // servers[] contains the ports of the set of
@@ -61,10 +80,20 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		mp:           make(map[Uid]chan interface{}),
+		id:           0,
+	}
+	// Your initialization code here.
+	if _, err := rand.Read(rsm.epoch[:]); err != nil {
+		panic("rsm: failed to generate epoch: " + err.Error())
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+
+	// 启动reader协程
+	go rsm.reader()
+
 	return rsm
 }
 
@@ -72,10 +101,12 @@ func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
 
-
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
 // try again.
+/*
+1.
+*/
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 	// Submit creates an Op structure to run a command through Raft;
@@ -83,5 +114,87 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	rsm.mu.Lock()
+	// assign id
+	id := rsm.AssignId()
+	op := Op{Me: rsm.me, Epoch: rsm.epoch, Id: id, Req: req}
+	uid := Uid{Me: rsm.me, Epoch: rsm.epoch, Id: id}
+	ch := make(chan interface{}, 1)
+	rsm.mp[uid] = ch
+	_, _, isleader := rsm.rf.Start(op)
+	rsm.mu.Unlock()
+
+	if !isleader {
+		// current server is not leader
+		return rpc.ErrWrongLeader, nil
+	}
+
+	retry := time.NewTicker(submitTimeout)
+	defer retry.Stop()
+
+	for {
+		select {
+		case res := <-ch:
+			// req hsa been applied on majority servers, return result
+			rsm.mu.Lock()
+			delete(rsm.mp, uid)
+			rsm.mu.Unlock()
+			return rpc.OK, res
+		case <-retry.C:
+			// check leadership
+			_, ld := rsm.rf.GetState()
+			// case 1: 不再是leader，返回ErrWrongLeader
+			if !ld {
+				rsm.mu.Lock()
+				delete(rsm.mp, uid)
+				rsm.mu.Unlock()
+				return rpc.ErrWrongLeader, nil
+			}
+			// case 2: 仍然是leader，继续等待
+			continue
+		}
+	}
+}
+
+// AssignId returns a unique id for each request
+// should called in lock
+func (rsm *RSM) AssignId() int {
+	id := rsm.id
+	rsm.id++
+	return id
+}
+
+/*
+每个server创建一个rsm，每个rsm有一个reader协程，该协程负责从raft的applyCh中读区消息并处理
+1. 读到Command：解析Op，调用server层的DoOp接口执行对应操作。然后根据op中的me判断自己是否是leader，若是，则需要利用channel去通知Submit协程该请求已经完成，Submit协程可以返回结果给客户端。
+2. 读到Snapshot：Todo
+*/
+func (rsm *RSM) reader() {
+	for {
+		msg := <-rsm.applyCh
+		// command 场景
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			uid := Uid{Me: op.Me, Epoch: op.Epoch, Id: op.Id}
+
+			// 调用DoOp
+			res := rsm.sm.DoOp(op.Req)
+
+			if op.Me != rsm.me {
+				// follower 直接返回
+				continue
+			}
+
+			// leader
+			rsm.mu.Lock()
+			ch, ok := rsm.mp[uid]
+			if !ok {
+				// Submit请求超时，已清理channel，直接返回
+				rsm.mu.Unlock()
+				continue
+			}
+			ch <- res
+			rsm.mu.Unlock()
+		}
+	}
 }

@@ -87,6 +87,13 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if _, err := rand.Read(rsm.epoch[:]); err != nil {
 		panic("rsm: failed to generate epoch: " + err.Error())
 	}
+
+	snp := persister.ReadSnapshot()
+	if len(snp) > 0 {
+		rsm.sm.Restore(snp)
+	}
+
+
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
@@ -183,6 +190,12 @@ func (rsm *RSM) reader() {
 			// 调用DoOp
 			res := rsm.sm.DoOp(op.Req)
 
+			// 判断是否需要生成snapshot
+			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > rsm.maxraftstate * 9 / 10 {
+				snp := rsm.sm.Snapshot()
+				rsm.rf.Snapshot(msg.CommandIndex, snp)
+			}
+
 			if op.Me != rsm.me {
 				// follower 直接返回
 				continue
@@ -198,6 +211,9 @@ func (rsm *RSM) reader() {
 			}
 			ch <- res
 			rsm.mu.Unlock()
+		} else if msg.SnapshotValid {
+			// snapshot 场景
+			rsm.sm.Restore(msg.Snapshot)
 		}
 	}
 }

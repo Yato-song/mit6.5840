@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"sync"
 
 	"6.5840/kvraft1/rsm"
@@ -8,7 +9,6 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/tester1"
-
 )
 
 type KVServer struct {
@@ -21,6 +21,11 @@ type KVServer struct {
 	values_ map[string]string
 	// store value version
 	versions_ map[string]rpc.Tversion
+}
+
+type SnapshotState struct {
+	Values   map[string]string
+	Versions map[string]rpc.Tversion
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -87,11 +92,48 @@ func (kv *KVServer) DoOp(req any) any {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	return kv.GenerateSnapshot()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	if len(data) == 0 {
+		return
+	}
+
+	var snapshot SnapshotState
+	dc := labgob.NewDecoder(bytes.NewBuffer(data))
+	if err := dc.Decode(&snapshot); err != nil {
+		panic("failed to decode snapshot: " + err.Error())
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.values_ = snapshot.Values
+	kv.versions_ = snapshot.Versions
+}
+
+func (kv *KVServer) GenerateSnapshot() []byte {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	snapshot := SnapshotState{
+		Values:   make(map[string]string),
+		Versions: make(map[string]rpc.Tversion),
+	}
+
+	for k, v := range kv.values_ {
+		snapshot.Values[k] = v
+	}
+
+	for k, v := range kv.versions_ {
+		snapshot.Versions[k] = v
+	}
+
+	var buf bytes.Buffer
+	ec := labgob.NewEncoder(&buf)
+	ec.Encode(snapshot)
+	return buf.Bytes()
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {

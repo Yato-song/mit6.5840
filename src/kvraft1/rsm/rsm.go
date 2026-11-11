@@ -121,11 +121,14 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	uid := Uid{Me: rsm.me, Epoch: rsm.epoch, Id: id}
 	ch := make(chan interface{}, 1)
 	rsm.mp[uid] = ch
-	_, _, isleader := rsm.rf.Start(op)
+	_, term, isleader := rsm.rf.Start(op)
 	rsm.mu.Unlock()
 
 	if !isleader {
 		// current server is not leader
+		rsm.mu.Lock()
+		delete(rsm.mp, uid)
+		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
 
@@ -142,9 +145,9 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 			return rpc.OK, res
 		case <-retry.C:
 			// check leadership
-			_, ld := rsm.rf.GetState()
-			// case 1: 不再是leader，返回ErrWrongLeader
-			if !ld {
+			term_now, ld := rsm.rf.GetState()
+			// case 1: 不再是leader，或者leader任期发生了改变，返回ErrWrongLeader
+			if !ld || term_now != term {
 				rsm.mu.Lock()
 				delete(rsm.mp, uid)
 				rsm.mu.Unlock()
